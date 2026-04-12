@@ -3,23 +3,20 @@ import requests
 import json
 from flask import Flask, request, jsonify
 from datetime import datetime
+import os
 
 app = Flask(__name__)
 
 # ==========================================
 #        CONFIGURACIÓN DE CREDENCIALES
 # ==========================================
-ODOO_URL = 'https://assemblik.odoo.com'
-ODOO_DB = 'assemblik'
-ODOO_USER = 'danbrito.mx@gmail.com'
-ODOO_API_KEY = '99a8a2a919186d115acb4cbda5db5b9f6932ed18'
+ODOO_URL = os.getenv('ODOO_URL', 'https://assemblik.odoo.com')
+ODOO_DB = os.getenv('ODOO_DB', 'assemblik')
+ODOO_USER = os.getenv('ODOO_USER', 'danbrito.mx@gmail.com')
+ODOO_API_KEY = os.getenv('ODOO_API_KEY', '99a8a2a919186d115acb4cbda5db5b9f6932ed18')
 
-MONDAY_API_KEY = 'eyJhbGciOiJIUzI1NiJ9.eyJ0aWQiOjE3OTE5NTA3OCwiYWFpIjoxMSwidWlkIjoyNzY0MDgxOCwiaWFkIjoiMjAyMi0wOS0wNVQxNTo1MjoxOS4wMDBaIiwicGVyIjoibWU6d3JpdGUiLCJhY3RpZCI6MTEwODIyMzksInJnbiI6InVzZTEifQ.p2h7mcyZxo6SQWxGx_UUotKx7QvHClt2V1l7mwmfkwU' 
+MONDAY_API_KEY = os.getenv('MONDAY_API_KEY', 'eyJhbGciOiJIUzI1NiJ9.eyJ0aWQiOjE3OTE5NTA3OCwiYWFpIjoxMSwidWlkIjoyNzY0MDgxOCwiaWFkIjoiMjAyMi0wOS0wNVQxNTo1MjoxOS4wMDBaIiwicGVyIjoibWU6d3JpdGUiLCJhY3RpZCI6MTEwODIyMzksInJnbiI6InVzZTEifQ.p2h7mcyZxo6SQWxGx_UUotKx7QvHClt2V1l7mwmfkwU') 
 MONDAY_API_URL = "https://api.monday.com/v2"
-
-# ==========================================
-#       FUNCIONES DE COMUNICACIÓN
-# ==========================================
 
 def obtener_detalles_monday(item_id):
     headers = {
@@ -53,7 +50,6 @@ def crear_venta_en_odoo(detalles_monday, item_id):
         uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_API_KEY, {})
         models = xmlrpc.client.ServerProxy(f'{ODOO_URL}/xmlrpc/2/object')
 
-        # Extraemos y limpiamos datos de Monday
         cols = {cv['id']: cv['text'] for cv in detalles_monday['column_values']}
         nombre_item_monday = detalles_monday['name'].strip() if detalles_monday['name'] else ""
         nombre_cliente     = cols.get('cliente', '').strip()
@@ -61,18 +57,21 @@ def crear_venta_en_odoo(detalles_monday, item_id):
         id_monday_col      = cols.get('id__de_elemento8', str(item_id)).strip()
         vendedor_final     = cols.get('personas', '').strip()
 
-        # --- Lógica del Mes ---
         meses = {1: "Enero", 2: "Febrero", 3: "Marzo", 4: "Abril", 5: "Mayo", 6: "Junio", 
                  7: "Julio", 8: "Agosto", 9: "Septiembre", 10: "Octubre", 11: "Noviembre", 12: "Diciembre"}
         mes_actual = meses[datetime.now().month]
 
-        # 1. Buscar Cliente (Partner)
+        # LÓGICA DE CLIENTE ORIGINAL
         partner_id = 2 
         if nombre_cliente:
             p_ids = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'res.partner', 'search', [[['name', '=', nombre_cliente]]])
-            if p_ids: partner_id = p_ids[0]
+            if p_ids:
+                partner_id = p_ids[0]
+            else:
+                # Si no existe, lo creamos (Para evitar el OdooBot que mencionabas)
+                partner_id = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'res.partner', 'create', [{'name': nombre_cliente}])
 
-        # 2. Buscar o Crear Proyecto
+        # LÓGICA DE PROYECTO ORIGINAL
         proyecto_id = False
         if nombre_item_monday:
             proj_ids = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'project.project', 'search', [[['name', '=', nombre_item_monday]]])
@@ -81,7 +80,6 @@ def crear_venta_en_odoo(detalles_monday, item_id):
             else:
                 proyecto_id = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'project.project', 'create', [{'name': nombre_item_monday}])
 
-        # 3. Preparar valores para Odoo
         venta_vals = {
             'partner_id': partner_id,
             'x_studio_vendedor': vendedor_final,
@@ -99,20 +97,34 @@ def crear_venta_en_odoo(detalles_monday, item_id):
             'x_studio_facturacin': 'Factura'
         }
 
-        print(f"DEBUG: Intentando crear para {vendedor_final}...")
-        
+        # --- EL CAMBIO CRÍTICO ESTÁ AQUÍ ---
+        # Añadimos un contexto para desactivar automatizaciones que causan el error de 'object not bound'
+        # Esto le dice a Odoo: "Crea el registro pero no ejecutes reglas automáticas de servidor"
+        contexto_seguro = {
+            'base_automation_pause': True, 
+            'skip_workflow': True,
+            'tracking_disable': True
+        }
+
         try:
-            # Intento de creación principal
-            venta_id = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'sale.order', 'create', [venta_vals])
-            print(f"✅ ÉXITO TOTAL: Presupuesto {venta_id} creado con vendedor.")
+            venta_id = models.execute_kw(
+                ODOO_DB, uid, ODOO_API_KEY, 
+                'sale.order', 'create', 
+                [venta_vals], 
+                {'context': contexto_seguro}
+            )
+            print(f"✅ ÉXITO: Presupuesto {venta_id} creado.")
             return venta_id
         except Exception as e_inner:
-            # Respaldo: Si el nombre del vendedor falla, crea la venta sin él para no bloquear el proceso
-            print(f"⚠️ Error de validación en vendedor '{vendedor_final}': {e_inner}")
+            print(f"⚠️ Reintentando sin vendedor: {e_inner}")
             if 'x_studio_vendedor' in venta_vals:
                 del venta_vals['x_studio_vendedor']
-                venta_id = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'sale.order', 'create', [venta_vals])
-                print(f"✅ Venta creada SIN vendedor (ID: {venta_id}). Revisa el valor técnico en Odoo Studio.")
+                venta_id = models.execute_kw(
+                    ODOO_DB, uid, ODOO_API_KEY, 
+                    'sale.order', 'create', 
+                    [venta_vals], 
+                    {'context': contexto_seguro}
+                )
                 return venta_id
             raise e_inner
 
@@ -120,28 +132,19 @@ def crear_venta_en_odoo(detalles_monday, item_id):
         print(f"❌ Error crítico en Odoo: {e}")
         return None
 
-# ==========================================
-#           RUTA DEL WEBHOOK (FLASK)
-# ==========================================
-
 @app.route('/webhook/monday', methods=['POST'])
 def monday_webhook():
     data = request.json
     if not data: return jsonify({"status": "error"}), 400
     if 'challenge' in data: return jsonify({'challenge': data['challenge']})
-
     event = data.get('event', {})
     item_id = event.get('pulseId')
-
     if item_id:
-        print(f"🔔 Procesando ID Monday: {item_id}")
         detalles = obtener_detalles_monday(item_id)
         if detalles:
-            odoo_id = crear_venta_en_odoo(detalles, item_id)
-            if odoo_id:
-                return jsonify({"status": "success", "odoo_id": odoo_id}), 200
-    
+            crear_venta_en_odoo(detalles, item_id)
     return jsonify({"status": "processed"}), 200
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
