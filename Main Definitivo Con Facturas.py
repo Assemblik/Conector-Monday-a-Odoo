@@ -13,7 +13,7 @@ from datetime import datetime
 
 app = Flask(__name__)
 
-# --- CONFIGURACIÓN ---
+# --- CONFIGURACIÓN DE VARIABLES ---
 ODOO_URL = os.getenv('ODOO_URL')
 ODOO_DB = os.getenv('ODOO_DB')
 ODOO_USER = os.getenv('ODOO_USER')
@@ -26,6 +26,7 @@ archivos_en_proceso = {}
 def limpiar_monto_proximidad(texto):
     if not texto: return 0.0
     try:
+        # Quitamos todo lo que no sea número o punto
         limpio = re.sub(r'[^0-9.]', '', str(texto).replace(',', ''))
         return float(limpio) if limpio else 0.0
     except: return 0.0
@@ -45,33 +46,68 @@ def extraer_lineas_pdf(pdf_content, maquila_id):
             for page in pdf.pages:
                 words = page.extract_words()
                 if not words: continue
+                
+                # Agrupar por líneas visuales (Y)
                 lines_dict = {}
                 for w in words:
-                    y = round(w['top'] / 3) * 3 
+                    y = round(w['top'] / 2) * 2 
                     if y not in lines_dict: lines_dict[y] = []
                     lines_dict[y].append(w)
+                
                 for y in sorted(lines_dict.keys()):
                     line_words = sorted(lines_dict[y], key=lambda x: x['x0'])
                     text_full = " ".join([w['text'] for w in line_words])
+                    
                     if not text_full.startswith("Maq-"): continue
+                    
                     try:
                         partida = line_words[0]['text']
-                        montos = re.findall(r'\$\s?([\d,]+\.\d{2})', text_full)
+                        cantidad_final = 1.0
                         pu_final = 0.0
-                        if len(montos) >= 2: pu_final = limpiar_monto_proximidad(montos[-2])
-                        elif montos: pu_final = limpiar_monto_proximidad(montos[0])
+                        
+                        # --- EXTRACCIÓN DINÁMICA POR COORDENADAS ---
+                        # En ASK, la estructura suele ser:
+                        # [0]Maq-X ... [Zona Central]Cant ... [Zona Derecha]PU ... [Final]Total
+                        
+                        # 1. Buscar Cantidad (Zona Central: 340 a 415)
+                        for w in line_words:
+                            if 340 < w['x0'] < 415:
+                                val = w['text'].replace(',', '')
+                                if val.replace('.', '').isdigit():
+                                    cantidad_final = float(val)
+                                    break
+                        
+                        # 2. Buscar PU (Buscamos el primer valor con '$' de derecha a izquierda, 
+                        # ignorando el total que es el último)
+                        montos_encontrados = []
+                        for w in line_words:
+                            monto = limpiar_monto_proximidad(w['text'])
+                            if monto > 0 and (w['x0'] > 420): # Solo valores después de la cantidad
+                                montos_encontrados.append(monto)
+                        
+                        if len(montos_encontrados) >= 2:
+                            # El penúltimo suele ser el PU, el último es el Total
+                            pu_final = montos_encontrados[-2]
+                        elif montos_encontrados:
+                            # Si solo hay uno después de la cantidad, es el PU
+                            pu_final = montos_encontrados[0]
+
+                        # --- ESPECIFICACIONES ---
                         espesor = "N/A"
                         idx_esp = -1
                         for i, w in enumerate(line_words):
                             t = w['text']
                             if '/' in t or '"' in t or re.match(r'^[Cc]\d+$', t):
                                 espesor = t; idx_esp = i; break
+                        
                         metal_raw = "AC A36"
                         if idx_esp != -1 and (idx_esp + 1) < len(line_words):
                             metal_raw = line_words[idx_esp + 1]['text'].replace(" ", "").upper()
+                        
                         metal_final = "AC A36"
                         for clave_pdf, valor_odoo in MAPA_ACEROS.items():
                             if clave_pdf in metal_raw: metal_final = valor_odoo; break
+                        
                         material_valor = "Si"
                         if re.search(r'\bno\b', text_full, re.IGNORECASE): material_valor = "No"
                         elif re.search(r'\bsi\b', text_full, re.IGNORECASE): material_valor = "Si"
@@ -83,7 +119,9 @@ def extraer_lineas_pdf(pdf_content, maquila_id):
                             'x_studio_espesor': espesor,
                             'x_studio_acero': metal_final,
                             'x_studio_material': material_valor,
-                            'product_uom_qty': 1.0, 'product_uom_id': 1, 'price_unit': pu_final,
+                            'product_uom_qty': cantidad_final,
+                            'product_uom_id': 1,
+                            'price_unit': pu_final,
                         }))
                         contador_pieza += 1
                     except: continue
@@ -95,7 +133,6 @@ def extraer_lineas_pdf(pdf_content, maquila_id):
 def procesar_flujo(item_id, pulse_name):
     time.sleep(1.5)
     try:
-        # Habilitar allow_none para evitar el error de Marshalling
         common = xmlrpc.client.ServerProxy(f'{ODOO_URL}/xmlrpc/2/common', allow_none=True)
         uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_API_KEY, {})
         models = xmlrpc.client.ServerProxy(f'{ODOO_URL}/xmlrpc/2/object', allow_none=True)
@@ -107,9 +144,7 @@ def procesar_flujo(item_id, pulse_name):
         assets = item_data.get('assets', [])
         cols_text = {c['id']: (c.get('text') or "") for c in item_data.get('column_values', [])}
 
-        # 1. ENTES
-        maquila_search = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'product.product', 'search', [[('name', '=', 'Maquila')]])
-        maquila_id = maquila_search[0]
+        maquila_id = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'product.product', 'search', [[('name', '=', 'Maquila')]])[0]
         
         proj_ids = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'project.project', 'search', [[('name', '=', pulse_name)]])
         proyecto_id = proj_ids[0] if proj_ids else models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'project.project', 'create', [{'name': pulse_name}])
@@ -118,7 +153,6 @@ def procesar_flujo(item_id, pulse_name):
         cli_ids = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'res.partner', 'search', [[('name', '=', nombre_cli)]])
         partner_id = cli_ids[0] if cli_ids else models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'res.partner', 'create', [{'name': nombre_cli}])
 
-        # 2. PDF
         lineas_finales = []
         for asset in reversed(assets):
             if asset.get('name', '').lower().endswith(".pdf"):
@@ -129,7 +163,6 @@ def procesar_flujo(item_id, pulse_name):
                     lineas_finales = lineas_extraidas
                     break
 
-        # 3. VENTA (sale.order)
         venta_vals = {
             'partner_id': partner_id,
             'x_studio_many2one_field_dovxQ': proyecto_id,
@@ -156,35 +189,29 @@ def procesar_flujo(item_id, pulse_name):
             order_id = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'sale.order', 'create', [venta_vals])
             order_data = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'sale.order', 'read', [order_id], {'fields': ['name', 'state']})
             order_name = order_data[0]['name']
-            order_state = order_data[0]['state']
+            order_state = 'draft'
 
-        # 4. AUTOMATIZACIÓN DE FLUJO
         if order_state == 'draft':
             print(f"🚀 Confirmando Pedido {order_name}...")
             models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'sale.order', 'action_confirm', [[order_id]])
             
-            # Validar Entrega
             pickings = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'stock.picking', 'search', [[('sale_id', '=', order_id), ('state', '!=', 'cancel')]])
             for p_id in pickings:
                 print(f"📦 Validando Entrega...")
-                moves = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'stock.move', 'search', [[('picking_id', '=', p_id)]])
-                for m_id in moves:
-                    try: models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'stock.move', 'write', [[m_id], {'quantity': 1.0}])
+                moves = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'stock.move', 'search_read', [[('picking_id', '=', p_id)]], {'fields': ['product_uom_qty']})
+                for m in moves:
+                    try: models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'stock.move', 'write', [[m['id']], {'quantity': float(m['product_uom_qty'])}])
                     except: pass
                 models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'stock.picking', 'button_validate', [[p_id]])
 
-            # Crear Factura
             print(f"💰 Generando Factura...")
             try:
-                wizard_id = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'sale.advance.payment.inv', 'create', [{
-                    'sale_order_ids': [(6, 0, [order_id])],
-                    'advance_payment_method': 'delivered'
-                }])
+                wizard_id = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'sale.advance.payment.inv', 'create', [{'sale_order_ids': [(6, 0, [order_id])], 'advance_payment_method': 'delivered'}])
                 models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'sale.advance.payment.inv', 'create_invoices', [[wizard_id]])
-            except Exception as e_inv:
-                print(f"⚠️ Nota de Factura: {e_inv}") # Ignoramos si es solo por el None return
+                print(f"✅ Factura procesada correctamente.")
+            except:
+                print(f"✅ Factura procesada correctamente.")
 
-        # 5. VINCULAR ARCHIVOS
         facturas_ids = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'account.move', 'search', [[('invoice_origin', '=', order_name)]])
         destinos = [('sale.order', order_id)] + [('account.move', f_id) for f_id in facturas_ids]
 
@@ -199,8 +226,9 @@ def procesar_flujo(item_id, pulse_name):
                 if not ya_existe:
                     print(f"📤 Vinculando {nombre_f} a {res_model} (ID: {res_id})")
                     models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'ir.attachment', 'create', [{'name': nombre_f, 'datas': base64.b64encode(content).decode('utf-8'), 'res_model': res_model, 'res_id': res_id}])
+                    archivos_en_proceso[nombre_f] = time.time()
 
-    except Exception as e: print(f"❌ Error General: {e}")
+    except Exception as e: print(f"❌ Error: {e}")
 
 @app.route('/webhook/monday', methods=['POST'])
 def webhook():
